@@ -6,15 +6,17 @@ import sys
 import os
 import traceback
 import select
+import time
 from sys import stdin
 
-PORT = 1883
+PORT = 8884
 TYPE_CONNECT = 0x10
 TYPE_CONNACK = 0x20
 TYPE_PUBLISH = 0x30
 TYPE_SUBSCRIBE = 0x82
 TYPE_SUBACK = 0x90
 TYPE_DISCONNECT = 0xe0
+packet_id = 0x0001
 
 ### auxiliary routines ###
 
@@ -38,14 +40,14 @@ def create_mqtt_publish_msg(topic, value, retain=False):
     msg_length = len(msg).to_bytes(1, byteorder='big')
     return msg_mqtt_flags + msg_length + msg
 
-def create_mqtt_subscriber_msg(topic, sub_id):
+def create_mqtt_subscriber_msg(topic, packet_id):
     """ 
     Creates a mqtt packet of type SUBSCRIBE with QoS=0.
     >>> create_mqtt_subscriber_msg("temper",1).hex()
     '820b0001000674656d70657200'
     """
     msg_mqtt_flags = (TYPE_SUBSCRIBE).to_bytes(1, byteorder='big')
-    msg_mqtt_id = sub_id.to_bytes(2, byteorder='big')
+    msg_mqtt_id = packet_id.to_bytes(2, byteorder='big')
     Qos = (0).to_bytes(1, byteorder='big')
     msg_topic = topic.encode("ascii")
     msg_topic_length = len(msg_topic).to_bytes(2, byteorder='big')
@@ -96,14 +98,14 @@ def create_mqtt_connack_msg():
     msg_l = len(msg).to_bytes(1, byteorder='big')
     return msg_mqtt_header + msg_l + msg
 
-def create_mqtt_suback_msg(sub_id):
+def create_mqtt_suback_msg(topic, packet_id):
     """ 
     Creates a mqtt packet of type CONNECT
-    >>> create_mqtt_suback_msg(1).hex()
+    >>> create_mqtt_suback_msg("temper",1).hex()
     '9003000100'
     """
     msg_mqtt_header = (TYPE_SUBACK).to_bytes(1, byteorder='big')
-    msg_id = sub_id.to_bytes(2, byteorder='big')
+    msg_id = packet_id.to_bytes(2, byteorder='big')
     Qos = (0).to_bytes(1, byteorder='big')
     msg = msg_id + Qos
     msg_l = len(msg).to_bytes(1, byteorder='big')
@@ -182,34 +184,38 @@ def get_head(msg):
 def run_publisher(addr, topic, pub_id, retain=False):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(addr)
-    s.send(create_mqtt_connect_msg(str(pub_id)))
+    s.send(create_mqtt_connect_msg(pub_id))
     connack = s.recv(1500)
     if connack.hex() == '20020000':
-        while True:
-            value = input()
-            s.send(create_mqtt_publish_msg(topic, value, retain))
-            if 2 == 1:
-                s.send(create_mqtt_disconnect_msg())
-                break
-        s.close
-    
-  
+        try:
+            time.sleep(1)
+            for line in stdin:
+                value = line[:-1]
+                s.send(create_mqtt_publish_msg(topic, value, retain))
+        except KeyboardInterrupt:
+            print("\ndisconnect")
+            s.send(create_mqtt_disconnect_msg())
+            s.close
+
 def run_subscriber(addr, topic, sub_id):
     s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     s.connect(addr)
-    s.send(create_mqtt_connect_msg(str(sub_id)))
+    s.send(create_mqtt_connect_msg(sub_id))
     connack = s.recv(1500)
     if connack.hex() == '20020000':
-        s.send(create_mqtt_subscriber_msg(topic, sub_id))
+        s.send(create_mqtt_subscriber_msg(topic, packet_id))
         while True:
-            msg = s.recv(1500)
-            if get_head(msg) == int(TYPE_SUBACK):
-                print("subscribed to " + topic)
-            elif get_head(msg) == int(TYPE_PUBLISH):
-                print(get_pub_value(msg))
-            elif 2 == 1:
+            try:
+                time.sleep(1)
+                msg = s.recv(1500)
+                if get_head(msg) == int(TYPE_SUBACK):
+                    print("subscribed to " + topic)
+                elif get_head(msg) == int(TYPE_PUBLISH) or get_head(msg) == (int(TYPE_PUBLISH)+1):
+                    print(topic,get_pub_value(msg))
+            except KeyboardInterrupt:
+                print("\ndisconnect")
                 s.send(create_mqtt_disconnect_msg())
-                break    
+                break
         s.close
 
 def run_server(addr):
@@ -219,8 +225,10 @@ def run_server(addr):
     s.listen(1)
     l = []
     sub = []
-
+    retainer = [("",0)]
+    print("INFO: start server addr=" + str(addr))
     while True:
+        print(retainer)
         r, _, _ = select.select(l + [s], [], [])
         for s2 in r:
             if s2 == s:
@@ -228,29 +236,57 @@ def run_server(addr):
                 connection = s3.recv(1500)
                 # connect msg
                 if get_head(connection) == int(TYPE_CONNECT):
-                    print("new client:", a, s3)
+                    print("new client:", a, get_connect_id(connection))
                     l = l + [s3]
                     s3.send(create_mqtt_connack_msg())
                 else:
                     print("erreur de trame CONNECTION: " + connection)
             else:
                 msg = s2.recv(1500)
+                # disconnect
+                if get_head(msg) == int(TYPE_DISCONNECT):
+                    print("client disconnected")
+                    for subscribe in sub:
+                        sub_socket, sub_topic = subscribe
+                        if sub_socket == s2:
+                            sub.remove((sub_socket,sub_topic))
+                    l.remove(s2)
+                    s2.close()
+                    continue
                 # publish msg
-                if get_head(msg) == int(TYPE_PUBLISH):
+                elif get_head(msg) == int(TYPE_PUBLISH):
+                    i = 0
                     for subscribe in sub:
                         sub_socket, sub_topic = subscribe
                         if sub_topic == get_pub_topic(msg):
+                            i+=1
                             sub_socket.send(msg)
+                    print(str(i) + " msg transmited to " + str(get_pub_topic(msg)))
+                # publish msg + retain true
+                elif get_head(msg) == (int(TYPE_PUBLISH)+1):
+                    i = 0
+                    # if exist retain, remove
+                    for r in retainer:
+                        r_topic, _ = r
+                        if r_topic == get_pub_topic(msg):
+                            retainer.remove(r)
+                    # set retain
+                    retainer.append((get_pub_topic(msg),get_pub_value(msg)))
+                    # subscribe
+                    for subscribe in sub:
+                        sub_socket, sub_topic = subscribe
+                        if sub_topic == get_pub_topic(msg):
+                            i+=1
+                            sub_socket.send(msg)
+                    print(str(i) + " msg transmited to " + str(get_pub_topic(msg)))
                 # subscribe msg
                 elif get_head(msg) == int(TYPE_SUBSCRIBE):
                     sub = sub + [(s2,get_sub_topic(msg))]
-                    s2.send(create_mqtt_suback_msg(get_sub_id(msg)))
-                # disconnect msg
-                elif len(msg) == 0:
-                    print("client disconnected")
-                    s2.close()
-                    l.remove(s2)
-                    continue
-                s2.sendall(msg)
-# run_server(('',PORT))
-# run_subscriber(('',PORT), "temper", 1)
+                    s2.send(create_mqtt_suback_msg(get_sub_topic(msg), get_sub_id(msg)))
+                    time.sleep(1)
+                    # retain
+                    for r in retainer:
+                        r_topic, r_value = r
+                        if r_topic == get_sub_topic(msg):
+                            s2.send(create_mqtt_publish_msg(r_topic, r_value, False))    
+    s.close
